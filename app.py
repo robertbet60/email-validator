@@ -5,9 +5,11 @@ import smtplib
 import dns.resolver
 import logging
 from flask import Flask, request, send_file, render_template_string
+from werkzeug.utils import secure_filename
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024  # Limit upload size to 2MB
 
 # Logging
 logging.basicConfig(filename='validation.log', level=logging.INFO)
@@ -19,7 +21,6 @@ ROLE_ADDRESSES = {"admin", "info", "support", "sales", "contact", "help", "postm
 # Email regex
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9._%+-]+@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})$")
 
-# Template for upload form
 UPLOAD_FORM = '''
 <!doctype html>
 <title>Email Validator</title>
@@ -36,7 +37,8 @@ def upload_file():
         file = request.files["file"]
         if not file:
             return "No file uploaded", 400
-        filepath = os.path.join("uploads", file.filename)
+        filename = secure_filename(file.filename)
+        filepath = os.path.join("uploads", filename)
         os.makedirs("uploads", exist_ok=True)
         file.save(filepath)
         output = validate_emails(filepath)
@@ -45,6 +47,10 @@ def upload_file():
 
 def validate_emails(csv_path):
     result_path = csv_path.replace(".csv", "_validated.csv")
+    valid_count = 0
+    risky_count = 0
+    invalid_count = 0
+
     with open(csv_path, newline='') as csvfile, open(result_path, 'w', newline='') as outfile:
         reader = csv.DictReader(csvfile)
         fieldnames = reader.fieldnames + ["status", "reason"]
@@ -54,7 +60,7 @@ def validate_emails(csv_path):
         emails = [(row, row["email"].strip()) for row in reader]
 
         with ThreadPoolExecutor(max_workers=min(10, len(emails))) as executor:
-            future_to_row = {executor.submit(validate_email, email): row for row, email in emails}
+            future_to_row = {executor.submit(validate_email_with_retry, email): row for row, email in emails}
             for future in as_completed(future_to_row):
                 row = future_to_row[future]
                 try:
@@ -64,7 +70,24 @@ def validate_emails(csv_path):
                 row["status"] = status
                 row["reason"] = reason
                 writer.writerow(row)
+
+                # Track results
+                if status == "valid":
+                    valid_count += 1
+                elif status == "risky":
+                    risky_count += 1
+                else:
+                    invalid_count += 1
+
+    logging.info(f"Validation complete: {valid_count} valid, {risky_count} risky, {invalid_count} invalid")
     return result_path
+
+def validate_email_with_retry(email, retries=1):
+    for attempt in range(retries + 1):
+        status, reason = validate_email(email)
+        if status != "risky" or attempt == retries:
+            return status, reason
+    return status, reason
 
 def validate_email(email):
     match = EMAIL_REGEX.match(email)
