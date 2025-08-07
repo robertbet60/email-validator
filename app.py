@@ -9,17 +9,16 @@ from werkzeug.utils import secure_filename
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024  # Limit upload size to 2MB
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024  # 2MB limit
 
-# Logging
+# Logging setup
 logging.basicConfig(filename='validation.log', level=logging.INFO)
 
-# Load domain blocklists
+# Load domain filters
 DISPOSABLE_DOMAINS = set(line.strip() for line in open("disposable_domains.txt") if line.strip())
 SPAM_TRAP_DOMAINS = set(line.strip() for line in open("bad_domains.txt") if line.strip())
 ROLE_ADDRESSES = {"admin", "info", "support", "sales", "contact", "help", "postmaster"}
 
-# Email regex
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9._%+-]+@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})$")
 
 HTML_TEMPLATE = '''
@@ -127,8 +126,13 @@ def validate_email(email):
     match = EMAIL_REGEX.match(email)
     if not match:
         return "invalid", "Invalid syntax"
+
     domain = match.group(1).lower()
     local_part = email.split("@")[0].lower()
+
+    # Heuristic filtering
+    if is_heuristically_risky(email):
+        return "risky", "Heuristically risky pattern"
 
     if domain in SPAM_TRAP_DOMAINS:
         return "risky", "Spam trap domain"
@@ -159,5 +163,50 @@ def validate_email(email):
         logging.info(f"SMTP error for {email}: {e}")
         return "risky", f"SMTP check failed: {e}"
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+def is_heuristically_risky(email):
+    """Flag emails based on known spam/fake patterns (global + Brazil-focused)"""
+    username, domain = email.lower().split("@")
+
+    risky_tlds = [".xyz", ".top", ".click", ".buzz", ".club", ".site", ".online", ".space", ".fun", ".work", ".shop"]
+    known_fake_terms = [
+        "teste", "testando", "senha", "usuario", "user", "admin", "example", "demo", 
+        "password", "foobar", "fulano", "ciclano", "beltrano", "zap", "12345", "abcdef", "test1"
+    ]
+    risky_domains = [
+        "zipmail.com.br", "bol.com.br", "uol.com.br", "superig.com.br", "r7.com",
+        "hotmail.co.uk", "mail.ru", "yopmail.com", "guerrillamail.com"
+    ]
+
+    # Numeric-only usernames
+    if username.isnumeric():
+        return True
+
+    # Username too short
+    if len(username) <= 2:
+        return True
+
+    # No vowels at all — likely machine generated
+    if not re.search(r"[aeiou]", username):
+        return True
+
+    # Obvious fake/test words in username
+    if any(term in username for term in known_fake_terms):
+        return True
+
+    # Domain itself is suspicious
+    if domain in risky_domains:
+        return True
+
+    # Suspicious TLDs
+    if any(domain.endswith(tld) for tld in risky_tlds):
+        return True
+
+    # Repetitive patterns like aaa, 111, zzz
+    if re.search(r"(.)\1{2,}", username):
+        return True
+
+    # Keywords like 'cpf' or 'rg' (Brazil ID terms) may suggest fake autofill
+    if "cpf" in username or "rg" in username:
+        return True
+
+    return False
