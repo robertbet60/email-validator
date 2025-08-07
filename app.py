@@ -4,7 +4,7 @@ import re
 import smtplib
 import dns.resolver
 import logging
-from flask import Flask, request, send_file, render_template_string
+from flask import Flask, request, send_file, render_template_string, url_for
 from werkzeug.utils import secure_filename
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -48,6 +48,10 @@ HTML_TEMPLATE = '''
       ❌ {{ summary.invalid }} invalid
     </div>
   {% endif %}
+
+  {% if download_link %}
+    <a class="btn btn-success" href="{{ download_link }}">Download Validated CSV</a>
+  {% endif %}
 </div>
 </body>
 </html>
@@ -56,6 +60,7 @@ HTML_TEMPLATE = '''
 @app.route("/", methods=["GET", "POST"])
 def upload_file():
     summary = None
+    download_link = None
     if request.method == "POST":
         file = request.files["file"]
         if not file:
@@ -65,11 +70,17 @@ def upload_file():
         os.makedirs("uploads", exist_ok=True)
         file.save(filepath)
         output, summary = validate_emails(filepath)
-        return render_template_string(HTML_TEMPLATE, summary=summary)
+        download_link = url_for("download_file", path=os.path.basename(output))
+        return render_template_string(HTML_TEMPLATE, summary=summary, download_link=download_link)
     return render_template_string(HTML_TEMPLATE)
 
+@app.route("/download/<path:path>")
+def download_file(path):
+    return send_file(os.path.join("uploads", path), as_attachment=True)
+
 def validate_emails(csv_path):
-    result_path = csv_path.replace(".csv", "_validated.csv")
+    base = os.path.basename(csv_path).replace(".csv", "")
+    result_path = os.path.join("uploads", f"{base}_validated.csv")
     valid_count = 0
     risky_count = 0
     invalid_count = 0
