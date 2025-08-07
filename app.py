@@ -3,9 +3,14 @@ import csv
 import re
 import smtplib
 import dns.resolver
+import logging
 from flask import Flask, request, send_file, render_template_string
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
+
+# Logging
+logging.basicConfig(filename='validation.log', level=logging.INFO)
 
 # Disposable and role-based lists
 DISPOSABLE_DOMAINS = set(line.strip() for line in open("disposable_domains.txt") if line.strip())
@@ -45,12 +50,20 @@ def validate_emails(csv_path):
         fieldnames = reader.fieldnames + ["status", "reason"]
         writer = csv.DictWriter(outfile, fieldnames=fieldnames)
         writer.writeheader()
-        for row in reader:
-            email = row["email"].strip()
-            status, reason = validate_email(email)
-            row["status"] = status
-            row["reason"] = reason
-            writer.writerow(row)
+
+        emails = [(row, row["email"].strip()) for row in reader]
+
+        with ThreadPoolExecutor(max_workers=min(10, len(emails))) as executor:
+            future_to_row = {executor.submit(validate_email, email): row for row, email in emails}
+            for future in as_completed(future_to_row):
+                row = future_to_row[future]
+                try:
+                    status, reason = future.result()
+                except Exception as e:
+                    status, reason = "error", str(e)
+                row["status"] = status
+                row["reason"] = reason
+                writer.writerow(row)
     return result_path
 
 def validate_email(email):
@@ -72,7 +85,6 @@ def validate_email(email):
         return "invalid", f"MX lookup failed: {e}"
 
     try:
-        # SMTP check with timeout
         server = smtplib.SMTP(mx_host, 25, timeout=10)
         server.set_debuglevel(0)
         server.helo("example.com")
@@ -85,10 +97,8 @@ def validate_email(email):
         else:
             return "invalid", f"SMTP rejected with code {code}"
     except Exception as e:
+        logging.info(f"SMTP error for {email}: {e}")
         return "risky", f"SMTP check failed: {e}"
-
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
-
