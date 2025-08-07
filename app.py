@@ -1,3 +1,4 @@
+
 import os
 import csv
 import re
@@ -21,10 +22,8 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(PROGRESS_DIR, exist_ok=True)
 
-# Logging setup
 logging.basicConfig(filename='validation.log', level=logging.INFO)
 
-# Load domain lists
 DISPOSABLE_DOMAINS = set(line.strip() for line in open("disposable_domains.txt") if line.strip())
 SPAM_TRAP_DOMAINS = set(line.strip() for line in open("bad_domains.txt") if line.strip())
 ROLE_ADDRESSES = {"admin", "info", "support", "sales", "contact", "help", "postmaster"}
@@ -44,7 +43,6 @@ def upload_file():
     filepath = os.path.join(UPLOAD_DIR, f"{uid}.csv")
     file.save(filepath)
 
-    # Start background thread
     thread = threading.Thread(target=validate_emails, args=(filepath, uid))
     thread.start()
 
@@ -75,14 +73,31 @@ def validate_emails(csv_path, job_id):
 
     with open(csv_path, newline='') as csvfile:
         reader = list(csv.DictReader(csvfile))
-        total = len(reader)
+        if not reader:
+            with open(progress_path, "w") as f:
+                f.write("done")
+            logging.error(f"No rows in file: {csv_path}")
+            return
+
+        email_column = None
+        for col in reader[0].keys():
+            if all("@" in row[col] for row in reader if row.get(col)):
+                email_column = col
+                break
+
+        if not email_column:
+            with open(progress_path, "w") as f:
+                f.write("done")
+            logging.error(f"No email-like column found in file: {csv_path}")
+            return
+
         with open(result_path, 'w', newline='') as outfile:
             fieldnames = reader[0].keys() | {"status", "reason"}
             writer = csv.DictWriter(outfile, fieldnames=fieldnames)
             writer.writeheader()
 
             def worker(row):
-                email = row["email"].strip()
+                email = row[email_column].strip()
                 try:
                     status, reason = validate_email(email)
                 except Exception as e:
@@ -98,7 +113,7 @@ def validate_emails(csv_path, job_id):
                     summary[status] += 1
                     writer.writerow(row)
                     with open(progress_path, "w") as f:
-                        f.write(str(int((i + 1) / total * 100)))
+                        f.write(str(int((i + 1) / len(reader) * 100)))
 
     with open(progress_path, "w") as f:
         f.write("done")
