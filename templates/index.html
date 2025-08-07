@@ -5,7 +5,7 @@
   <title>Email Validator</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
   <style>
-    #loader { display: none; }
+    #loader, #progress-container { display: none; }
   </style>
 </head>
 <body class="bg-light">
@@ -22,7 +22,14 @@
     <div class="spinner-border text-primary" role="status">
       <span class="visually-hidden">Validating...</span>
     </div>
-    <p class="mt-2">Processing, please wait...</p>
+    <p class="mt-2">Preparing validation...</p>
+  </div>
+
+  <div id="progress-container" class="mt-4">
+    <p>Progress:</p>
+    <div class="progress">
+      <div id="progress-bar" class="progress-bar" role="progressbar" style="width: 0%">0%</div>
+    </div>
   </div>
 
   <div id="results" class="mt-4"></div>
@@ -31,6 +38,8 @@
 <script>
 const form = document.getElementById("upload-form");
 const loader = document.getElementById("loader");
+const progressContainer = document.getElementById("progress-container");
+const progressBar = document.getElementById("progress-bar");
 const results = document.getElementById("results");
 
 form.addEventListener("submit", async (e) => {
@@ -42,41 +51,38 @@ form.addEventListener("submit", async (e) => {
   formData.append("file", fileInput.files[0]);
 
   loader.style.display = "block";
+  progressContainer.style.display = "none";
   results.innerHTML = "";
 
   try {
-    const res = await fetch("/validate", {
+    const res = await fetch("/upload", {
       method: "POST",
       body: formData
     });
 
-    const data = await res.json();
+    const { job_id } = await res.json();
     loader.style.display = "none";
+    progressContainer.style.display = "block";
 
-    if (data.error) {
-      results.innerHTML = `<div class="alert alert-danger">${data.error}</div>`;
-      return;
-    }
+    const poll = setInterval(async () => {
+      const statusRes = await fetch(`/progress/${job_id}`);
+      const data = await statusRes.json();
 
-    let summaryHTML = `<div class="alert alert-info"><strong>Summary:</strong><br>`;
-    for (const [key, val] of Object.entries(data.summary)) {
-      const label = key.includes("valid") ? "✅" :
-                    key.includes("risky") ? "⚠️" :
-                    key.includes("invalid") ? "❌" : "ℹ️";
-      summaryHTML += `${label} <code>${key}</code>: ${val}<br>`;
-    }
-    summaryHTML += `</div>`;
-
-    summaryHTML += `
-      <a class="btn btn-success me-2" href="${data.downloads.all}">Download All</a>
-      <a class="btn btn-outline-primary me-2" href="${data.downloads.valid}">Download Valid Only</a>
-      <a class="btn btn-outline-warning" href="${data.downloads.risky}">Download Risky Only</a>
-    `;
-
-    results.innerHTML = summaryHTML;
-
+      if (data.status === "done") {
+        clearInterval(poll);
+        progressBar.style.width = "100%";
+        progressBar.innerText = "100%";
+        results.innerHTML = `
+          <a class="btn btn-success mt-4" href="/result/${job_id}">Download Result</a>
+        `;
+      } else {
+        progressBar.style.width = data.percent + "%";
+        progressBar.innerText = data.percent + "%";
+      }
+    }, 2000);
   } catch (err) {
     loader.style.display = "none";
+    progressContainer.style.display = "none";
     results.innerHTML = `<div class="alert alert-danger">Error: ${err.message}</div>`;
   }
 });
