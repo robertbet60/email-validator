@@ -4,7 +4,7 @@ import re
 import smtplib
 import dns.resolver
 import logging
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, render_template
 from werkzeug.utils import secure_filename
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
@@ -23,6 +23,10 @@ SPAM_TRAP_DOMAINS = set(line.strip() for line in open("bad_domains.txt") if line
 ROLE_ADDRESSES = {"admin", "info", "support", "sales", "contact", "help", "postmaster"}
 
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9._%+-]+@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})$")
+
+@app.route("/", methods=["GET"])
+def home():
+    return render_template("index.html")
 
 @app.route("/validate", methods=["POST"])
 def validate_route():
