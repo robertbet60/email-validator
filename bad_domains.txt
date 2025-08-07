@@ -1,0 +1,3 @@
+trapsmtp.com
+spammail.org
+blockeddomain.xyz
