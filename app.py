@@ -52,6 +52,31 @@ def validate_route():
 @app.route("/download/<path:filename>")
 def download_file(filename):
     return send_file(os.path.join(UPLOAD_DIR, filename), as_attachment=True)
+@app.route("/dashboard")
+def dashboard():
+    return render_template("dashboard.html")
+
+@app.route("/stats")
+def stats():
+    summary = defaultdict(int)
+    log_path = "validation.log"
+    if os.path.exists(log_path):
+        with open(log_path) as f:
+            for line in f:
+                if "Summary:" in line:
+                    try:
+                        match = eval(line.split("Summary:")[-1].strip())
+                        for k, v in match.items():
+                            summary[k] += v
+                    except:
+                        continue
+    total = sum(summary.values())
+    return jsonify({
+        "total": total,
+        "valid": summary.get("valid", 0),
+        "risky": sum(v for k, v in summary.items() if "risky" in k),
+        "invalid": sum(v for k, v in summary.items() if "invalid" in k)
+    })
 
 def validate_emails(csv_path):
     global progress
