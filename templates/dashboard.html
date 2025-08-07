@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Validation Dashboard</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-light">
+<div class="container mt-5">
+  <h1>Email Validation Dashboard</h1>
+  <div class="mt-4">
+    <p><strong>Total Emails Validated:</strong> <span id="total">Loading...</span></p>
+    <p><strong>Valid:</strong> <span class="text-success" id="valid">-</span></p>
+    <p><strong>Risky:</strong> <span class="text-warning" id="risky">-</span></p>
+    <p><strong>Invalid:</strong> <span class="text-danger" id="invalid">-</span></p>
+  </div>
+  <div class="mt-4">
+    <button class="btn btn-secondary" onclick="fetchStats()">Refresh</button>
+  </div>
+</div>
+
+<script>
+async function fetchStats() {
+  const res = await fetch("/stats");
+  const data = await res.json();
+  document.getElementById("total").innerText = data.total;
+  document.getElementById("valid").innerText = data.valid;
+  document.getElementById("risky").innerText = data.risky;
+  document.getElementById("invalid").innerText = data.invalid;
+}
+fetchStats();
+</script>
+</body>
+</html>
