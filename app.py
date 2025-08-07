@@ -14,25 +14,48 @@ app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024  # Limit upload size to 2MB
 # Logging
 logging.basicConfig(filename='validation.log', level=logging.INFO)
 
-# Disposable and role-based lists
+# Load domain blocklists
 DISPOSABLE_DOMAINS = set(line.strip() for line in open("disposable_domains.txt") if line.strip())
+SPAM_TRAP_DOMAINS = set(line.strip() for line in open("bad_domains.txt") if line.strip())
 ROLE_ADDRESSES = {"admin", "info", "support", "sales", "contact", "help", "postmaster"}
 
 # Email regex
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9._%+-]+@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})$")
 
-UPLOAD_FORM = '''
+HTML_TEMPLATE = '''
 <!doctype html>
-<title>Email Validator</title>
-<h1>Upload CSV with emails (header must be "email")</h1>
-<form method=post enctype=multipart/form-data>
-  <input type=file name=file>
-  <input type=submit value=Upload>
-</form>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Email Validator</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-light">
+<div class="container mt-5">
+  <h1 class="mb-4">Email Validator</h1>
+  <form method=post enctype=multipart/form-data class="mb-3">
+    <div class="mb-3">
+      <input class="form-control" type=file name=file required>
+    </div>
+    <button class="btn btn-primary" type=submit>Upload and Validate</button>
+  </form>
+
+  {% if summary %}
+    <div class="alert alert-info">
+      <strong>Validation Summary:</strong><br>
+      ✅ {{ summary.valid }} valid<br>
+      ⚠️ {{ summary.risky }} risky<br>
+      ❌ {{ summary.invalid }} invalid
+    </div>
+  {% endif %}
+</div>
+</body>
+</html>
 '''
 
 @app.route("/", methods=["GET", "POST"])
 def upload_file():
+    summary = None
     if request.method == "POST":
         file = request.files["file"]
         if not file:
@@ -41,9 +64,9 @@ def upload_file():
         filepath = os.path.join("uploads", filename)
         os.makedirs("uploads", exist_ok=True)
         file.save(filepath)
-        output = validate_emails(filepath)
-        return send_file(output, as_attachment=True)
-    return render_template_string(UPLOAD_FORM)
+        output, summary = validate_emails(filepath)
+        return render_template_string(HTML_TEMPLATE, summary=summary)
+    return render_template_string(HTML_TEMPLATE)
 
 def validate_emails(csv_path):
     result_path = csv_path.replace(".csv", "_validated.csv")
@@ -71,7 +94,6 @@ def validate_emails(csv_path):
                 row["reason"] = reason
                 writer.writerow(row)
 
-                # Track results
                 if status == "valid":
                     valid_count += 1
                 elif status == "risky":
@@ -79,8 +101,9 @@ def validate_emails(csv_path):
                 else:
                     invalid_count += 1
 
-    logging.info(f"Validation complete: {valid_count} valid, {risky_count} risky, {invalid_count} invalid")
-    return result_path
+    logging.info(f"Summary — Valid: {valid_count}, Risky: {risky_count}, Invalid: {invalid_count}")
+    summary = {"valid": valid_count, "risky": risky_count, "invalid": invalid_count}
+    return result_path, summary
 
 def validate_email_with_retry(email, retries=1):
     for attempt in range(retries + 1):
@@ -93,10 +116,12 @@ def validate_email(email):
     match = EMAIL_REGEX.match(email)
     if not match:
         return "invalid", "Invalid syntax"
-    domain = match.group(1)
+    domain = match.group(1).lower()
     local_part = email.split("@")[0].lower()
 
-    if domain.lower() in DISPOSABLE_DOMAINS:
+    if domain in SPAM_TRAP_DOMAINS:
+        return "risky", "Spam trap domain"
+    if domain in DISPOSABLE_DOMAINS:
         return "risky", "Disposable domain"
     if local_part in ROLE_ADDRESSES:
         return "risky", "Role-based address"
