@@ -11,27 +11,31 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024  # 2MB max upload
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+progress = {"done": 0, "total": 0}
 
 # Logging
 logging.basicConfig(filename='validation.log', level=logging.INFO)
 
-# Domain filters
 DISPOSABLE_DOMAINS = set(line.strip() for line in open("disposable_domains.txt") if line.strip())
 SPAM_TRAP_DOMAINS = set(line.strip() for line in open("bad_domains.txt") if line.strip())
 ROLE_ADDRESSES = {"admin", "info", "support", "sales", "contact", "help", "postmaster"}
 
-# Email regex
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9._%+-]+@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})$")
 
 @app.route("/", methods=["GET"])
 def home():
     return render_template("index.html")
 
+@app.route("/progress", methods=["GET"])
+def progress_status():
+    return jsonify(progress)
+
 @app.route("/validate", methods=["POST"])
 def validate_route():
+    global progress
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
     file = request.files["file"]
@@ -39,10 +43,10 @@ def validate_route():
     filepath = os.path.join(UPLOAD_DIR, filename)
     file.save(filepath)
 
-    files, summary = validate_emails(filepath)
+    output, summary = validate_emails(filepath)
     return jsonify({
         "summary": summary,
-        "downloads": files
+        "downloads": output
     })
 
 @app.route("/download/<path:filename>")
@@ -50,6 +54,7 @@ def download_file(filename):
     return send_file(os.path.join(UPLOAD_DIR, filename), as_attachment=True)
 
 def validate_emails(csv_path):
+    global progress
     base = os.path.basename(csv_path).replace(".csv", "")
     all_path = os.path.join(UPLOAD_DIR, f"{base}_all.csv")
     valid_path = os.path.join(UPLOAD_DIR, f"{base}_valid.csv")
@@ -57,21 +62,19 @@ def validate_emails(csv_path):
 
     summary = defaultdict(int)
 
-    with open(csv_path, newline='') as csvfile, \
-         open(all_path, 'w', newline='') as all_out, \
-         open(valid_path, 'w', newline='') as valid_out, \
-         open(risky_path, 'w', newline='') as risky_out:
+    with open(csv_path, newline='') as csvfile,          open(all_path, 'w', newline='') as all_out,          open(valid_path, 'w', newline='') as valid_out,          open(risky_path, 'w', newline='') as risky_out:
 
         reader = csv.DictReader(csvfile)
         fieldnames = reader.fieldnames + ["status", "reason", "score"]
         all_writer = csv.DictWriter(all_out, fieldnames=fieldnames)
         valid_writer = csv.DictWriter(valid_out, fieldnames=fieldnames)
         risky_writer = csv.DictWriter(risky_out, fieldnames=fieldnames)
-
         for w in (all_writer, valid_writer, risky_writer):
             w.writeheader()
 
         emails = [(row, row["email"].strip()) for row in reader]
+        progress["done"] = 0
+        progress["total"] = len(emails)
 
         with ThreadPoolExecutor(max_workers=10) as executor:
             futures = {executor.submit(validate_email_with_retry, email): row for row, email in emails}
@@ -88,8 +91,8 @@ def validate_emails(csv_path):
                 elif status.startswith("risky"):
                     risky_writer.writerow(row)
                 summary[status] += 1
+                progress["done"] += 1
 
-    logging.info(f"Validation summary: {dict(summary)}")
     return {
         "all": f"/download/{os.path.basename(all_path)}",
         "valid": f"/download/{os.path.basename(valid_path)}",
@@ -102,7 +105,7 @@ def validate_email_with_retry(email, retries=2):
             return validate_email(email)
         except Exception as e:
             if attempt < retries:
-                time.sleep(2 ** attempt)  # Exponential backoff
+                time.sleep(2 ** attempt)
             else:
                 return "risky:smtp-error", f"SMTP retry failed: {e}", 60
 
@@ -136,13 +139,12 @@ def validate_email(email):
         server.mail("validator@yourdomain.com")
         code, _ = server.rcpt(email)
         server.quit()
-
         if 200 <= code < 300:
             return "valid", "Accepted by SMTP", 100
         elif 400 <= code < 500:
-            return "risky:smtp-soft", f"Temporary SMTP error ({code})", 70
+            return "risky:smtp-soft", f"Temp SMTP error ({code})", 70
         else:
-            return "invalid:smtp", f"SMTP rejected ({code})", 0
+            return "invalid:smtp", f"Rejected ({code})", 0
     except Exception as e:
         return "risky:smtp-error", f"SMTP exception: {e}", 60
 
@@ -164,7 +166,7 @@ def is_heuristically_risky(email):
         return True
     if domain in risky_domains or any(domain.endswith(tld) for tld in risky_tlds):
         return True
-    if re.search(r"(.)\\1{2,}", user) or "cpf" in user or "rg" in user:
+    if re.search(r"(.)\1{2,}", user) or "cpf" in user or "rg" in user:
         return True
 
     return False
