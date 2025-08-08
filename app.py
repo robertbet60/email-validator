@@ -28,7 +28,8 @@ logging.basicConfig(filename=os.path.join(BASE_DIR, 'validation.log'), level=log
 DISPOSABLE_DOMAINS = set(line.strip() for line in open(os.path.join(BASE_DIR, "disposable_domains.txt")) if line.strip())
 SPAM_TRAP_DOMAINS = set(line.strip() for line in open(os.path.join(BASE_DIR, "bad_domains.txt")) if line.strip())
 ROLE_ADDRESSES = {"admin", "info", "support", "sales", "contact", "help", "postmaster"}
-EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9._%+-]+@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})$")
+EMAIL_REGEX = re.compile(r"^(?!.*\.\.)[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+
 
 @app.route("/")
 def index():
