@@ -72,9 +72,24 @@ form.addEventListener("submit", async (e) => {
         clearInterval(poll);
         progressBar.style.width = "100%";
         progressBar.innerText = "100%";
-        results.innerHTML = `
-          <a class="btn btn-success mt-4" href="/result/${job_id}">Download Result</a>
+
+        const resultRes = await fetch(`/result/${job_id}`);
+        const resultData = await resultRes.json();
+
+        let summaryHTML = `<div class="alert alert-info"><strong>Summary:</strong><br>`;
+        for (const [line] of Object.entries(resultData.summary.split("\n"))) {
+          summaryHTML += `${resultData.summary.split("\n")[line]}<br>`;
+        }
+        summaryHTML += `</div>`;
+
+        summaryHTML += `
+          <a class="btn btn-success me-2" href="${resultData.downloads.all}">Download All</a>
+          <a class="btn btn-outline-primary me-2" href="${resultData.downloads.valid}">Download Valid</a>
+          <a class="btn btn-outline-warning me-2" href="${resultData.downloads.risky}">Download Risky</a>
+          <a class="btn btn-outline-danger" href="${resultData.downloads.invalid}">Download Invalid</a>
         `;
+
+        results.innerHTML = summaryHTML;
       } else {
         progressBar.style.width = data.percent + "%";
         progressBar.innerText = data.percent + "%";
