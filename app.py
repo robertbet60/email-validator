@@ -8,8 +8,9 @@ import threading
 import uuid
 from flask import Flask, request, jsonify, send_file, render_template
 from werkzeug.utils import secure_filename
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from collections import defaultdict
+from functools import partial
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5MB max upload
@@ -22,10 +23,8 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(PROGRESS_DIR, exist_ok=True)
 
-# Logging setup
 logging.basicConfig(filename=os.path.join(BASE_DIR, 'validation.log'), level=logging.INFO)
 
-# Load domain lists
 DISPOSABLE_DOMAINS = set(line.strip() for line in open(os.path.join(BASE_DIR, "disposable_domains.txt")) if line.strip())
 SPAM_TRAP_DOMAINS = set(line.strip() for line in open(os.path.join(BASE_DIR, "bad_domains.txt")) if line.strip())
 ROLE_ADDRESSES = {"admin", "info", "support", "sales", "contact", "help", "postmaster"}
@@ -110,7 +109,7 @@ def validate_emails(csv_path, job_id):
     results = []
     valid_rows, risky_rows, invalid_rows = [], [], []
 
-    def process(row):
+    def wrapped_validate(row):
         email = row.get(email_key, "").strip()
         try:
             status, reason = validate_email(email)
@@ -120,23 +119,37 @@ def validate_emails(csv_path, job_id):
         row["reason"] = reason
         return row, status
 
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        futures = [executor.submit(process, row) for row in rows]
-        for i, future in enumerate(as_completed(futures)):
-            row, status = future.result()
-            summary[status] += 1
-            results.append(row)
-            if status.startswith("valid"):
-                valid_rows.append(row)
-            elif status.startswith("risky"):
-                risky_rows.append(row)
-            else:
-                invalid_rows.append(row)
-            with open(progress_path, "w") as f:
-                f.write(str(int((i + 1) / total * 100)))
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_row = {executor.submit(wrapped_validate, row): row for row in rows}
+        completed = 0
+
+        while future_to_row:
+            done, _ = wait(future_to_row, timeout=10, return_when=FIRST_COMPLETED)
+            for future in done:
+                try:
+                    row, status = future.result(timeout=8)
+                    summary[status] += 1
+                    results.append(row)
+                    if status.startswith("valid"):
+                        valid_rows.append(row)
+                    elif status.startswith("risky"):
+                        risky_rows.append(row)
+                    else:
+                        invalid_rows.append(row)
+                except Exception as e:
+                    logging.warning(f"Validation thread failed: {e}")
+                    continue
+                finally:
+                    completed += 1
+                    with open(progress_path, "w") as f:
+                        f.write(str(int((completed / total) * 100)))
+                    del future_to_row[future]
+
+    if not results:
+        logging.error("No results produced!")
+        return
 
     fieldnames = results[0].keys()
-
     def write_csv(path, rows):
         with open(path, "w", newline='') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -154,6 +167,7 @@ def validate_emails(csv_path, job_id):
 
     with open(progress_path, "w") as f:
         f.write("done")
+
     logging.info(f"Job {job_id} finished. Summary: {dict(summary)}")
 
 def validate_email(email):
@@ -179,7 +193,7 @@ def validate_email(email):
         return "invalid:mx", f"MX lookup failed: {e}"
 
     try:
-        server = smtplib.SMTP(mx_host, 25, timeout=10)
+        server = smtplib.SMTP(mx_host, 25, timeout=8)
         server.helo("example.com")
         server.mail("test@example.com")
         code, _ = server.rcpt(email)
@@ -189,7 +203,7 @@ def validate_email(email):
         else:
             return "invalid:smtp", f"SMTP code {code}"
     except Exception as e:
-        return "risky:smtp-error", f"SMTP check failed: {e}"
+        return "risky:smtp-error", f"SMTP failed: {e}"
 
 def is_heuristically_risky(email):
     username, domain = email.lower().split("@")
