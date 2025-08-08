@@ -20,7 +20,7 @@
 
   <div id="loader" class="mt-4">
     <div class="spinner-border text-primary" role="status">
-      <span class="visually-hidden">Validating...</span>
+      <span class="visually-hidden">Preparing validation...</span>
     </div>
     <p class="mt-2">Preparing validation...</p>
   </div>
@@ -59,7 +59,6 @@ form.addEventListener("submit", async (e) => {
       method: "POST",
       body: formData
     });
-
     const { job_id } = await res.json();
     loader.style.display = "none";
     progressContainer.style.display = "block";
@@ -76,23 +75,21 @@ form.addEventListener("submit", async (e) => {
         const resultRes = await fetch(`/result/${job_id}`);
         const resultData = await resultRes.json();
 
-        let summaryHTML = `<div class="alert alert-info"><strong>Summary:</strong><br>`;
-        for (const [line] of Object.entries(resultData.summary.split("\n"))) {
-          summaryHTML += `${resultData.summary.split("\n")[line]}<br>`;
-        }
-        summaryHTML += `</div>`;
-
-        summaryHTML += `
-          <a class="btn btn-success me-2" href="${resultData.downloads.all}">Download All</a>
-          <a class="btn btn-outline-primary me-2" href="${resultData.downloads.valid}">Download Valid</a>
-          <a class="btn btn-outline-warning me-2" href="${resultData.downloads.risky}">Download Risky</a>
-          <a class="btn btn-outline-danger" href="${resultData.downloads.invalid}">Download Invalid</a>
+        const summaryHTML = `
+          <div class="alert alert-info"><strong>Summary:</strong><br>
+            <pre>${resultData.summary}</pre>
+          </div>
+          <div class="mb-3">
+            <a class="btn btn-success me-2" href="${resultData.downloads.all}">⬇️ Download All</a>
+            <a class="btn btn-outline-primary me-2" href="${resultData.downloads.valid}">✅ Valid Only</a>
+            <a class="btn btn-outline-warning me-2" href="${resultData.downloads.risky}">⚠️ Risky Only</a>
+            <a class="btn btn-outline-danger" href="${resultData.downloads.invalid}">❌ Invalid Only</a>
+          </div>
         `;
-
         results.innerHTML = summaryHTML;
       } else {
-        progressBar.style.width = data.percent + "%";
-        progressBar.innerText = data.percent + "%";
+        progressBar.style.width = `${data.percent}%`;
+        progressBar.innerText = `${data.percent}%`;
       }
     }, 2000);
   } catch (err) {
