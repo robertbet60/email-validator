@@ -42,15 +42,23 @@ logging.basicConfig(
 # -----------------------------
 HELO_NAME = "validator.bancadobrasil.com"   # matches A & PTR
 MAIL_FROM = "verify@bancadobrasil.com"      # allowed by SPF
-SMTP_TIMEOUT = 8                             # seconds per SMTP phase
-DNS_TIMEOUT = 3                              # per UDP try
-DNS_LIFETIME = 5                             # total resolve time
-TRY_STARTTLS = True                          # attempt STARTTLS if offered
-SMTP_RETRY_ON_TRANSIENT = 1                  # retry once on transient net errors
-TRANSIENT_SMTP_CODES = {421, 450, 451, 452, 454, 471}  # treat as transient
-# Backoff cache to avoid hammering the same MX after net failures (in-memory)
+
+# timeouts & concurrency
+SMTP_TIMEOUT = 8          # seconds per SMTP phase
+DNS_TIMEOUT = 3           # per UDP try
+DNS_LIFETIME = 5          # total resolve time
+TRY_STARTTLS = True       # attempt STARTTLS if offered
+
+# retries & backoff
+SMTP_RETRY_ON_TRANSIENT = 1
+TRANSIENT_SMTP_CODES = {421, 450, 451, 452, 454, 471}
 MX_BACKOFF_SECONDS = 60
-_last_mx_backoff = {}  # {mx_host: until_epoch}
+_last_mx_backoff = {}     # {mx_host: until_epoch}
+
+# watchdog / batching
+MAX_WORKERS = 6
+PER_TASK_HARD_TIMEOUT = 15  # seconds (absolute cap per email)
+BATCH_SIZE = 5000
 
 # -----------------------------
 # Data & Regex
@@ -60,19 +68,31 @@ def _load_lines(path):
     if not os.path.exists(p):
         return set()
     with open(p, "r", encoding="utf-8") as f:
-        return {ln.strip() for ln in f if ln.strip()}
+        return {ln.strip().lower() for ln in f if ln.strip() and not ln.startswith("#")}
 
 DISPOSABLE_DOMAINS = _load_lines("disposable_domains.txt")
 SPAM_TRAP_DOMAINS = _load_lines("bad_domains.txt")
 ROLE_ADDRESSES = {"admin", "info", "support", "sales", "contact", "help", "postmaster"}
 
-# Tight syntax: no double dots, TLD >=2, no spaces
-EMAIL_REGEX = re.compile(r"^(?!.*\.\.)[a-zA-Z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+# Tight syntax: no double dots, TLD >=2, no spaces, length guard
+EMAIL_REGEX = re.compile(
+    r"^(?=.{6,254}$)(?!.*\.\.)[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$"
+)
 
 # dns.resolver tuned instance
 _resolver = dns.resolver.Resolver()
 _resolver.timeout = DNS_TIMEOUT
 _resolver.lifetime = DNS_LIFETIME
+
+# job-scoped MX cache (domain -> mx_host)
+# Filled per-job in validate_emails(); passed to validate_email()
+def _resolve_mx_cached(domain_l: str, mx_cache: dict):
+    if domain_l in mx_cache:
+        return mx_cache[domain_l]
+    mx_answers = _resolver.resolve(domain_l, "MX")
+    mx_host = str(sorted(mx_answers, key=lambda r: r.preference)[0].exchange).rstrip(".")
+    mx_cache[domain_l] = mx_host
+    return mx_host
 
 # -----------------------------
 # Routes
@@ -107,6 +127,8 @@ def check_progress(job_id):
         pct = int(txt)
     except:
         pct = 0
+    # keep UI under 100 until files are completely written
+    pct = max(0, min(99, pct))
     return jsonify({"status": "processing", "percent": pct})
 
 @app.route("/result/<job_id>")
@@ -147,7 +169,14 @@ def validate_emails(path, job_id):
 
     # Read CSV (robust to BOM and missing header)
     with open(path, "r", encoding="utf-8-sig", newline="") as csvfile:
-        reader = csv.DictReader(csvfile)
+        # Auto sniff dialect if possible
+        sample = csvfile.read(4096)
+        csvfile.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample) if sample else csv.excel
+        except Exception:
+            dialect = csv.excel
+        reader = csv.DictReader(csvfile, dialect=dialect)
         if not reader.fieldnames:
             logging.error("CSV has no header/columns")
             _write_progress(progress_path, "done")
@@ -155,58 +184,89 @@ def validate_emails(path, job_id):
         # Try to find 'email' column by name (case-insensitive); fallback to first column
         lower_map = {h.lower().strip(): h for h in reader.fieldnames}
         email_key = lower_map.get("email", reader.fieldnames[0])
-        rows = [r for r in reader if any(v.strip() for v in r.values() if isinstance(v, str))]
+        rows = [r for r in reader if any((v or "").strip() for v in r.values())]
+
+    # De-duplicate emails (keep first occurrence)
+    seen = set()
+    uniq_rows = []
+    for r in rows:
+        e = (r.get(email_key) or "").strip().lower()
+        if not e:
+            continue
+        if e not in seen:
+            seen.add(e)
+            uniq_rows.append(r)
+    rows = uniq_rows
 
     total = len(rows)
     if total == 0:
-        logging.info(f"Job {job_id}: empty CSV after filtering")
+        logging.info(f"Job {job_id}: empty CSV after filtering/dedupe")
         _write_progress(progress_path, "done")
         return
 
-    batch_size = 5000
-    batches = [rows[i:i + batch_size] for i in range(0, total, batch_size)]
+    batches = [rows[i:i + BATCH_SIZE] for i in range(0, total, BATCH_SIZE)]
 
     all_rows, valid_rows, risky_rows, invalid_rows = [], [], [], []
     summary = defaultdict(int)
     completed = 0
 
-    for batch in batches:
-        # modest concurrency to avoid saturating the box / MXs
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            future_to_row = {executor.submit(_validate_row_safe, r, email_key): r for r in batch}
+    # job-scoped MX cache
+    mx_cache = {}
 
-            while future_to_row:
-                done, _ = wait(future_to_row, timeout=10, return_when=FIRST_COMPLETED)
-                if not done:
-                    # Nothing finished in 10s – keep looping; progress will move when tasks complete
-                    continue
+    for batch_index, batch in enumerate(batches, start=1):
+        logging.info("Job %s: batch %d/%d size=%d", job_id, batch_index, len(batches), len(batch))
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_info = {}
+            for r in batch:
+                fut = executor.submit(_validate_row_guarded, r, email_key, mx_cache)
+                future_to_info[fut] = {"start": time.time(), "row": r}
+
+            while future_to_info:
+                done, _ = wait(list(future_to_info.keys()), timeout=2, return_when=FIRST_COMPLETED)
+
+                # handle finished
                 for fut in done:
+                    info = future_to_info.pop(fut, None)
+                    if info is None:
+                        continue
                     try:
-                        row, status = fut.result(timeout=1)
+                        row, status = fut.result(timeout=0)
                     except Exception as e:
-                        row = future_to_row[fut]
-                        status = "error"
-                        row["status"] = "error"
-                        row["reason"] = f"worker: {e}"
-                        logging.warning(f"Worker failure: {e}")
+                        logging.warning("Future failed: %s", e)
+                        row = info["row"]
+                        status = "risky:worker-error"
+                        row["status"] = status
+                        row["reason"] = f"Worker error: {e}"
 
-                    all_rows.append(row)
-                    summary[status] += 1
-                    if status.startswith("valid"):
-                        valid_rows.append(row)
-                    elif status.startswith("risky"):
-                        risky_rows.append(row)
-                    else:
-                        invalid_rows.append(row)
-
+                    _collect(row, status, all_rows, valid_rows, risky_rows, invalid_rows, summary)
                     completed += 1
-                    # cap UI at 99% until we finish writing files
-                    pct = min(99, int((completed / total) * 100))
-                    _write_progress(progress_path, str(pct))
-                    del future_to_row[fut]
+                    _write_progress(progress_path, str(min(99, int(completed / total * 100))))
+
+                # watchdog for stragglers
+                now = time.time()
+                to_force = []
+                for fut, info in list(future_to_info.items()):
+                    age = now - info["start"]
+                    if age > PER_TASK_HARD_TIMEOUT:
+                        row = info["row"]
+                        row["status"] = "risky:timeout"
+                        row["reason"] = f"Exceeded {PER_TASK_HARD_TIMEOUT}s"
+                        to_force.append(fut)
+                        _collect(row, "risky:timeout",
+                                 all_rows, valid_rows, risky_rows, invalid_rows, summary)
+                        completed += 1
+                        _write_progress(progress_path, str(min(99, int(completed / total * 100))))
+                for fut in to_force:
+                    future_to_info.pop(fut, None)
+
+                time.sleep(0.05)
 
     # write outputs
-    fieldnames = list(all_rows[0].keys())
+    fieldnames = sorted({k for r in all_rows for k in r.keys()})
+    if "status" not in fieldnames: fieldnames.append("status")
+    if "reason" not in fieldnames: fieldnames.append("reason")
+
     _write_csv(result_all, fieldnames, all_rows)
     _write_csv(result_valid, fieldnames, valid_rows)
     _write_csv(result_risky, fieldnames, risky_rows)
@@ -214,11 +274,21 @@ def validate_emails(path, job_id):
 
     # summary
     with open(summary_path, "w", encoding="utf-8") as f:
-        for k, v in sorted(summary.items()):
-            f.write(f"{k}: {v}\n")
+        for k in sorted(summary):
+            f.write(f"{k}: {summary[k]}\n")
 
     _write_progress(progress_path, "done")
     logging.info(f"Job {job_id} finished: {dict(summary)}")
+
+def _collect(row, status, all_rows, valid_rows, risky_rows, invalid_rows, summary):
+    all_rows.append(row)
+    summary[status] += 1
+    if status.startswith("valid"):
+        valid_rows.append(row)
+    elif status.startswith("risky"):
+        risky_rows.append(row)
+    else:
+        invalid_rows.append(row)
 
 def _write_csv(path, fieldnames, rows):
     with open(path, "w", encoding="utf-8", newline="") as f:
@@ -230,23 +300,23 @@ def _write_progress(path, txt):
     with open(path, "w", encoding="utf-8") as f:
         f.write(txt)
 
-def _validate_row_safe(row, key):
+def _validate_row_guarded(row, key, mx_cache):
     email = (row.get(key) or "").strip()
     if not email:
         row["status"] = "invalid:empty"
         row["reason"] = "No email in row"
         return row, "invalid:empty"
     try:
-        status, reason = validate_email(email)
+        status, reason = validate_email(email, mx_cache)
     except Exception as e:
-        status, reason = "error", f"exception: {e}"
+        status, reason = "risky:exception", f"{type(e).__name__}: {e}"
     row["status"], row["reason"] = status, reason
     return row, status
 
 # -----------------------------
 # Email checks (syntax, lists, DNS, SMTP)
 # -----------------------------
-def validate_email(email: str):
+def validate_email(email: str, mx_cache: dict):
     # 1) syntax
     if not EMAIL_REGEX.match(email):
         return "invalid:syntax", "Invalid format"
@@ -265,73 +335,69 @@ def validate_email(email: str):
     if local_l in ROLE_ADDRESSES:
         return "risky:role-based", "Role-based address"
 
-    # 3) DNS (MX)
+    # 3) DNS (MX) with per-job cache
     try:
-        mx_answers = _resolver.resolve(domain_l, "MX")
-        mx_host = str(sorted(mx_answers, key=lambda r: r.preference)[0].exchange).rstrip(".")
+        mx_host = _resolve_mx_cached(domain_l, mx_cache)
     except Exception as e:
         return "invalid:mx", f"MX lookup failed: {e}"
 
-    # Optional: in-memory backoff if the MX recently errored at socket level
+    # MX backoff if recent net errors
     now = time.time()
     until = _last_mx_backoff.get(mx_host, 0)
     if now < until:
         return "risky:smtp-error", "Backoff on MX after recent network error"
 
-    # 4) SMTP RCPT probe (with EHLO, optional STARTTLS, one retry)
+    # 4) SMTP RCPT probe (EHLO, optional STARTTLS, one retry)
     attempt = 0
     last_err = None
     while attempt <= SMTP_RETRY_ON_TRANSIENT:
         attempt += 1
+        server = None
         try:
             server = smtplib.SMTP(mx_host, 25, local_hostname=HELO_NAME, timeout=SMTP_TIMEOUT)
-            server.ehlo_or_helo_if_needed()
+            code, _ = server.ehlo_or_helo_if_needed()
 
-            # STARTTLS if offered (some providers insist on TLS before RCPT)
-            if TRY_STARTTLS:
+            # STARTTLS if offered
+            if TRY_STARTTLS and code == 250:
                 try:
                     if server.has_extn("starttls"):
                         ctx = ssl.create_default_context()
                         server.starttls(context=ctx)
-                        server.ehlo()  # re-EHLO after TLS
+                        server.ehlo()
                 except Exception as tls_e:
-                    # Not fatal for validation; continue without TLS
-                    logging.info(f"{mx_host}: STARTTLS skipped: {tls_e}")
+                    logging.info("%s: STARTTLS skipped: %s", mx_host, tls_e)
 
-            # MAIL FROM & RCPT TO
             server.mail(MAIL_FROM)
             code, resp = server.rcpt(email)
-            server.quit()
+            try:
+                server.quit()
+            except Exception:
+                pass
 
             if code in (250, 251):
                 return "valid", "SMTP accepted"
-            elif code in TRANSIENT_SMTP_CODES:
+            if code in TRANSIENT_SMTP_CODES:
                 last_err = f"Transient SMTP {code}"
-                continue  # retry once
-            else:
-                return "invalid:smtp", f"SMTP {code}"
+                continue
+            return "invalid:smtp", f"SMTP {code}"
 
         except (socket.timeout, smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError,
                 smtplib.SMTPHeloError, smtplib.SMTPDataError, smtplib.SMTPRecipientsRefused,
                 ConnectionRefusedError, OSError) as e:
             last_err = str(e)
-            # transient network problem → retry once
+            # retry if allowed
             continue
         except Exception as e:
-            # Unknown/unexpected
-            server_quit_silent()
+            if server:
+                try:
+                    server.quit()
+                except Exception:
+                    pass
             return "risky:smtp-error", f"SMTP failed: {e}"
 
-    # If we got here, both attempts failed transiently — set backoff
+    # If we reach here, both attempts failed transiently — set MX backoff
     _last_mx_backoff[mx_host] = time.time() + MX_BACKOFF_SECONDS
     return "risky:smtp-error", (last_err or "SMTP transient/timeout")
-
-def server_quit_silent(server=None):
-    try:
-        if server:
-            server.quit()
-    except Exception:
-        pass
 
 # -----------------------------
 # Heuristics
